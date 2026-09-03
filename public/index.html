@@ -67,6 +67,11 @@
   .stCh.pulse{animation:pulse 1.1s ease-in-out infinite}
   .relayTag{font-size:10px;background:#fff3e0;color:#b9780a;padding:2px 7px;border-radius:10px;margin-left:6px;white-space:nowrap}
   .tcard .err{margin-top:6px;padding:6px 10px;border-radius:8px;background:#fff1f0;color:#c93a2e;font-size:12px;border:1px solid #f5c2be;line-height:1.4}
+  .tcard .actRow{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .tcard .miniBtn{padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:#fff;color:var(--fg);font-size:12px;cursor:pointer}
+  .tcard .miniBtn.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+  .tcard .miniBtn.warn{background:#fff8ef;border-color:#ffd38f;color:#8a5a00}
+  .forceRelayToggle{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:var(--sub);user-select:none;cursor:pointer}
   .bar{height:8px;background:#eef1f5;border-radius:6px;overflow:hidden}
   .bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2f6bff,#5b8bff);transition:width .2s}
   .meta{display:flex;justify-content:space-between;font-size:11.5px;color:var(--sub);margin-top:6px}
@@ -130,6 +135,10 @@
       <button class="btn" id="sendBtn" disabled>发送</button>
       <span id="selInfo" style="font-size:12.5px;color:var(--sub)">未选择接收方</span>
     </div>
+    <label class="forceRelayToggle" id="forceRelayToggle" title="AP隔离无法P2P时启用（慢，仅建议小文件）">
+      <input type="checkbox" id="forceRelayCB" />
+      <span>🐢 强制低速中转兜底（P2P 连接不上时勾选，速度会降到 100–500 KB/s）</span>
+    </label>
   </div>
 
   <div class="card">
@@ -217,7 +226,13 @@
     'wss://test.mosquitto.org:8081/mqtt',
     'wss://broker.hivemq.com:8884/mqtt'
   ]);
-  const forceRelay = new URLSearchParams(location.search).has('forcerelay');
+  const forceRelayQS = new URLSearchParams(location.search).has('forcerelay');
+  // 当前全局"强制中转"开关 = QS.forcerelay 或 peer 区勾选框
+  function isForceRelayMode(){
+    try { return !!forceRelayQS || !!(document.getElementById('forceRelayCB') && document.getElementById('forceRelayCB').checked); }
+    catch(e){ return !!forceRelayQS; }
+  }
+  const forceRelay = forceRelayQS;
   let myName = ss.getItem('land_name') || ('我' + Math.floor(Math.random()*900+100));
   let uid = ss.getItem('land_uid') || (Math.random().toString(36).slice(2,8));
   ss.setItem('land_uid', uid);
@@ -788,9 +803,30 @@
 
   async function ensureOut(target){
     let o = state.outSessions.get(target.uid);
-    const usable = o && o.mode==='p2p' && o.dc && o.dc.readyState==='open' && o.status!=='failed' && o.status!=='canceled';
-    if (usable) return o;
+    const wantRelay = isForceRelayMode();
+    // 如果要中转，则复用「mode===relay 且未关闭」的会话；如果要直连，则复用 mode===p2p open 的通道
+    const okRelay = wantRelay && o && (o.mode==='relay' || o.useRelay) && o.status!=='failed' && o.status!=='canceled';
+    const okP2P   = !wantRelay && o && o.mode==='p2p' && o.dc && o.dc.readyState==='open' && o.status!=='failed' && o.status!=='canceled';
+    if (okRelay || okP2P) return o;
     if (o) removeCardByRef(o);
+
+    if (wantRelay){
+      // 用户明确要中转 → 直接创建一个纯中转会话（不建PC/DC，不再等 13.5s）
+      let markReady;
+      const oo = { uid:target.uid, target, mode:'relay', pc:null, dc:null, status:'connecting', error:'',
+        readyP: new Promise(r=>markReady=r), useRelay:true, __manualRelay:true,
+        job:null, speed:0, _t0:0, _sent:0, _acc:0, linkType:'relay', relay:true, _mqttRelay: (transport&&transport.kind==='mqtt') };
+      state.outSessions.set(target.uid, oo);
+      pushCard({ dir:'out', o:oo });
+      // 初始化通道状态 & 立即 markReady
+      if (transport && transport.kind === 'mqtt') oo._mqttRelay = true;
+      oo.status = 'idle';
+      if (!_p2pToastShown){ _p2pToastShown=true; toast('已进入低速中转模式（速度几百KB/s，仅建议 <10MB 小文件）','warn'); }
+      setTimeout(()=>{ markReady(); kickPending(oo); }, 0);
+      await oo.readyP;
+      return oo;
+    }
+
     const oo = openOutSession(target);
     // 关键：必须等到数据通道真正打开(或降级为中转)后再发送，否则会在 connecting 状态直接失败
     await oo.readyP;
@@ -873,10 +909,14 @@
         try {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
+          // 发送端也主动注入已知本地 IP host candidate（尤其iOS Safari作为发起端时也需要）
+          injectLocalHostCandidates(pc);
           const r = await signalTo(target.uid, { kind:'offer', sdp:offer, __stage:label });
           if (!r.ok) throw new Error(r.error||'对方不在线');
           const to = setTimeout(()=>{ if (!settled) onFail && onFail(); }, timeoutMs);
           await o.readyP; clearTimeout(to);
+          // 通道打通后再做一次候选注入（以防answer后生成新ufrag）
+          setTimeout(()=>injectLocalHostCandidates(pc), 50);
         } catch(e){
           if (!settled) onFail ? onFail() : failOutLocal(e.message||'建链失败');
         }
@@ -896,10 +936,10 @@
 
   function fallbackToRelay(o, target, markReady){
     // 宁停不慢：默认不自动降级中转（中转会让速度降到几百 KB/s）
-    // 仅当用户显式在 URL 加 ?forcerelay=1，或通过 UI 按钮「低速中转兜底」手动触发时才启用
-    if (!forceRelay && !o.__manualRelay){
+    // 仅当（URL ?forcerelay=1 或 peer区勾选"强制中转" 或 失败卡片上点了「低速中转兜底重发」）才触发
+    if (!isForceRelayMode() && !o.__manualRelay){
       TR('fallbackToRelay skipped (宁停不慢)');
-      if (o.status==='connecting') { o.status='failed'; o.error='P2P直连受阻（未开启低速中转兜底模式）'; updateProgress(o); }
+      if (o.status==='connecting') { o.status='failed'; o.error='P2P直连受阻（勾选下方「🐢强制低速中转」或在失败卡片点击「低速中转兜底重发」即可走公共信令发送）'; updateProgress(o); }
       return;
     }
     if (o.useRelay) return;
@@ -915,6 +955,46 @@
     markReady && markReady(); kickPending(o);
   }
   function kickPending(o){ if (o._pendingJob){ const j=o._pendingJob; o._pendingJob=null; runJob(o, j); } }
+
+  // 失败卡片上「重试直连 / 低速中转兜底重发」的统一入口：复用上次选中的文件
+  function retryOutSession(oldOut, useRelay){
+    try {
+      const target = oldOut.target;
+      if (!target) return;
+      // 取旧 job.files 的映射（每个 f.file 或 f.name 还原）
+      // 旧 job 里是 f.file(File 对象) + f.name + f.size，直接复用即可
+      const jobFiles = (oldOut.job && oldOut.job.files) || [];
+      if (!jobFiles.length){ toast('没有可重试的文件','warn'); return; }
+      // 如果旧卡片未关：先把错误清掉 & 改 connecting，不新建卡片（会复用同一个 out session 的 uid）
+      oldOut.status = 'connecting'; oldOut.error = ''; oldOut.job = null; oldOut._t0 = 0;
+      updateProgress(oldOut);
+
+      // 关闭旧的连接（pc/dc）确保干净
+      try { oldOut.pc && oldOut.pc.close(); } catch(e){}
+      try { oldOut.dc && oldOut.dc.close(); } catch(e){}
+      oldOut.pc = null; oldOut.dc = null; oldOut.useRelay = false; oldOut.relay = false; oldOut.mode = 'p2p';
+
+      let markReady; oldOut.readyP = new Promise(r=>markReady=r);
+      if (useRelay){
+        // 直接进入中转（不握手，不等待）
+        oldOut.__manualRelay = true;
+        fallbackToRelay(oldOut, target, markReady);
+      } else {
+        // 重新做两级 P2P 握手（走 openOutSession 内部的 runStage 逻辑会重复写 session，所以我们这里复制一份 setup + runStage）
+        // 简单做法：从 state.outSessions 移除后重新 ensureOut，不过会新建卡片。更简单的：直接走 ensureOut 新建一张卡片。
+        state.outSessions.delete(target.uid);
+        removeCardByRef(oldOut);
+        const fileRefs = jobFiles.map(f => ({ id:f.fileId || f.name, file:f.file, name:f.name, size:f.size }));
+        startSend(target, fileRefs).catch(e=>toast('重试失败：'+e.message,'warn'));
+        return;
+      }
+      // 中转模式：等 ready，然后 runJob 把旧文件再发一遍
+      oldOut.readyP.then(()=>{
+        const refs = jobFiles.map(f => ({ id:f.fileId || f.name, file:f.file, name:f.name, size:f.size }));
+        runJob(oldOut, refs);
+      }).catch(e=>toast('中转启动失败：'+e.message,'warn'));
+    } catch(e){ toast('重试异常：'+e.message,'warn'); }
+  }
 
   async function runJob(o, fileRefs){
     // 完成过的任务（done）与就绪（idle）、连接中（connecting）都允许开启新任务；
@@ -1128,6 +1208,42 @@
     return g;
   }
 
+  // 关键 Workaround：iOS Safari 在 HTTPS 页面不把真实本地 IP 写进 ICE host candidate（指纹保护），
+  //  但我们已经通过 getLocalIps()+STUN 在 computeNetKey() 里拿到了所有本地私有 IP（netKeyInfo.locals）。
+  //  这里把每个已知本地 IP 构造为标准 SDP host candidate，直接交给 addIceCandidate()——等价于"手工声明我有这些 host 候选"，
+  //  让两端（尤其iOS）即使浏览器自身 ICE 收集不到 host，也能在 Host-Only 阶段用明文私有 IP 配对成功。
+  async function injectLocalHostCandidates(pc){
+    try {
+      if (!pc || !netKeyInfo || !netKeyInfo.locals || !netKeyInfo.locals.length) return;
+      const ufrag = (()=>{
+        try {
+          const lp = pc.localDescription && pc.localDescription.sdp;
+          if (!lp) return null;
+          const m = lp.match(/a=ice-ufrag:([\w+/=-]+)/);
+          return m ? m[1] : null;
+        } catch(e){ return null; }
+      })();
+      if (!ufrag) return;
+      for (const ip of netKeyInfo.locals){
+        if (!ip) continue;
+        // 构造 candidate-line：foundation component protocol priority ip port type [raddr/rport] generation
+        // 这里仅用 UDP 1 号组件（RTP/数据组件）即可，WebRTC SCTP/DataChannel 跑在同一个组件上
+        // component=1（RTP）虽然是音频视频术语，但用于 datachannel 的 SCTP association 时 1/2 都兼容
+        for (const comp of [1]){
+          for (const port of [9, 65432]){
+            // priority 按 RFC 5245 默认公式即可，随便给一个合理值
+            const prio = (1<<24)*126 + (1<<8)*(65535 - comp) + (256 - 0);
+            const cand = `candidate:0 1 udp ${prio} ${ip} ${port} typ host generation 0 ufrag ${ufrag} network-id 1 network-cost 50`;
+            try {
+              await pc.addIceCandidate({ candidate: cand, sdpMid: '0', sdpMLineIndex: 0 }).catch(()=>{});
+            } catch(e){}
+          }
+        }
+      }
+      TR('injectHostCandidates count=' + netKeyInfo.locals.length);
+    } catch(e){ TR('injectHostCandidates ERR:'+e.message); }
+  }
+
   async function incomingOffer(from, name, sdp){
     TR('offer:enter kind=' + (sdp && sdp.type) + ' sdpLen=' + ((sdp&&sdp.sdp)||'').length);
     const g = createRecvGroup(from, name, 'desktop');
@@ -1135,13 +1251,25 @@
     // 若已经有打开的 dc → 接收端 early return（发送端在 host-only 阶段就打通了的话不要重建）
     if (g.dc && g.dcState==='open'){ g.earlyReturn = true; TR('offer:early (open)'); return; }
     if (g.pc){ try{ g.pc.close(); }catch(e){} g.pc=null; g.dc=null; g.dcState=''; }
-    // 优先 Host-Only 建链（空 iceServers）——这才是跑满局域网带宽的关键
-    const pc = new RTCPeerConnection({ iceServers: [] });
-    g.pc = pc; TR('offer:pc(host-first)');
-    pc.onicecandidate = e => { if (e.candidate) signalTo(from, { kind:'ice', candidate:e.candidate }); };
+
+    // ★ 修复 A（双向对称）：识别发送端当前阶段 → 接收端用同样 iceServers 建 PC
+    //  发送端在 signalTo 的 offer 里带了 __stage='host' 或 __stage='stun'（runStage 里）。
+    //  另外如果 SDP 字符串里已经出现 typ srflx 候选（发送端开了STUN），也视为 stun 阶段。
+    const outerStage = (sdp && typeof sdp==='object' && sdp.__stage) ? String(sdp.__stage) : '';
+    const sdpStr = (sdp && sdp.sdp) ? sdp.sdp : (typeof sdp==='string' ? sdp : '');
+    const containSrflx = /typ\s+srflx/.test(sdpStr) || /typ\s+relay/.test(sdpStr);
+    let stage = outerStage || (containSrflx ? 'stun' : (g.__hostFailed ? 'stun' : 'host'));
+    if (stage !== 'host' && stage !== 'stun') stage = 'host';
+
+    const iceServers = (stage === 'stun') ? FALLBACK_STUN : [];
+    const pc = new RTCPeerConnection({ iceServers });
+    g.pc = pc; TR('offer:pc stage='+stage+' iceCount='+iceServers.length);
+    pc.onicecandidate = e => { if (e.candidate) signalTo(from, { kind:'ice', candidate:e.candidate, __rstage:stage }); };
     pc.onconnectionstatechange = () => {
-      TR('offer:cs:' + pc.connectionState);
-      if (pc.connectionState==='failed' && g.status!=='receiving' && !g.act) g.__hostFailed = true;
+      TR('offer:cs:' + pc.connectionState + ' stage='+stage);
+      if (pc.connectionState==='failed'){
+        if (stage==='host' && g.status!=='receiving' && !g.act) g.__hostFailed = true;
+      }
     };
     let dc;
     try {
@@ -1160,8 +1288,10 @@
       for (const c of (g.pendingIce||[])) { try{await pc.addIceCandidate(c);}catch(e){} } g.pendingIce=[];
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      const r = await signalTo(from, { kind:'answer', sdp:answer });
-      TR('offer:answered');
+      // ★ 修复 B：setLocalDescription 之后立刻注入已知本地 IP 做 host candidate（iOS Safari 指纹保护 workaround）
+      injectLocalHostCandidates(pc);
+      const r = await signalTo(from, { kind:'answer', sdp:answer, __rstage:stage });
+      TR('offer:answered stage='+stage);
       if (!r.ok) window.__errs.push('answer:'+(r.error||''));
     } catch(e){ window.__errs.push('offer:'+e.message); TR('offer:ERR:'+e.message); }
   }
@@ -1401,6 +1531,14 @@
       speed = ` · ${fmtSpeed(sp)} · 剩余 ${sp>0 && done<total ? Math.ceil((total-done)/sp)+'s' : '…'}`;
     }
     const errTxt = ref.error ? `<div class="err">${esc(ref.error)}</div>` : '';
+    // 失败卡片的操作区：直连重试 + 低速中转兜底（立即重发同批文件，不再刷新/不再等13.5s）
+    let actRow = '';
+    if (ref.job && ref.status==='failed'){
+      actRow = `<div class="actRow">
+        <button class="miniBtn primary" data-act="retry">🔄 重试直连</button>
+        <button class="miniBtn warn" data-act="relay">🐢 低速中转兜底重发</button>
+      </div>`;
+    }
     ref._card.innerHTML = `<div class="top">
       <span class="tname">${dirTxt} ${KIND_ICON[(ref.target&&ref.target.kind)||ref.fromKind]||'📡'} ${esc(nm||'')}</span>
       ${linkTag}
@@ -1408,8 +1546,14 @@
       <button class="closeBtn" data-act="close">✕</button></div>
       <div class="bar"><i style="width:${pct}%"></i></div>
       <div class="meta"><span>${pct}% · ${fmtSize(done)} / ${fmtSize(total)}</span><span>${speed}</span></div>
-      ${errTxt}`;
-    ref._card.querySelector('[data-act="close"]').onclick=()=>removeCardByRef(ref);
+      ${errTxt}
+      ${actRow}`;
+    ref._card.querySelectorAll('[data-act]').forEach(btn=>{
+      const a = btn.dataset.act;
+      if (a==='close') btn.onclick=()=>removeCardByRef(ref);
+      else if (a==='retry' && ref.job && ref.target) btn.onclick=()=>retryOutSession(ref, /*useRelay*/false);
+      else if (a==='relay' && ref.job && ref.target) btn.onclick=()=>retryOutSession(ref, /*useRelay*/true);
+    });
     // 文件行
     if (ref.job){ ref.job.files.forEach(f=>{ if(f.row) f.row.set(f.acked||0); }); }
     else if (ref.files){
