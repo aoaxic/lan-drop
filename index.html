@@ -152,6 +152,7 @@
   // 公共信令 broker 列表（自动故障切换；可自建 Mosquitto/EMQX 后用 ?broker=wss://... 覆盖）
   const MQTT_BROKERS = (QS.get('broker') ? [QS.get('broker')] : [
     'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker.emqx.io:443/mqtt',
     'wss://test.mosquitto.org:8081/mqtt',
     'wss://broker.hivemq.com:8884/mqtt'
   ]);
@@ -248,7 +249,7 @@
     ws.binaryType='arraybuffer';
     ws.onopen=()=>{
       // 必须先等 CONNACK 再 SUBSCRIBE，否则 EMQX 会拒绝订阅
-      ws.send(mqttPkt(0x10,[0,4,...encStr('MQTT'),4,0x02,0,60,...encStr('land'+Math.random().toString(36).slice(2,12))]));
+      ws.send(mqttPkt(0x10,[...encStr('MQTT'),4,0x02,0,60,...encStr('land'+Math.random().toString(36).slice(2,12))]));
       keep=setInterval(()=>{ if(ws&&ws.readyState===1) ws.send(new Uint8Array([0xC0,0])); },30000);
       // 注意：必须在收到 CONNACK 后才能 SUBSCRIBE，否则 broker 会直接忽略订阅
     };
