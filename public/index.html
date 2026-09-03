@@ -228,7 +228,12 @@
   async function computeNetKey(){
     const [pub, locals] = await Promise.all([fetchPubIp(), getLocalIps()]);
     const subnet = locals.length ? locals[0].split('.').slice(0,3).join('.')+'.0' : '';
-    return { key: hashStr((pub||'no-pub')+'|'+subnet).slice(0,12), pub, subnet, locals };
+    // 分组优先级：
+    //  1) 双方都拿到了公网出口 IP → 按 出口IP|子网 精确分组（同出口=同局域网，最可靠）
+    //  2) 任意一方没拿到公网 IP（部分手机/网络环境 API 被拦截）→ 退化为只按子网前缀分组，
+    //     保证同一 192.168.x / 10.x / 172.16-31.x 子网的设备一定能互见
+    const base = pub ? (pub + '|' + subnet) : ('subnet-only|' + subnet);
+    return { key: hashStr(base).slice(0,12), pub, subnet, locals };
   }
 
   // ---------- 极简 MQTT over WebSocket 客户端(仅 CONNECT/PUBLISH/SUBSCRIBE/PING) ----------

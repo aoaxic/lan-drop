@@ -122,7 +122,12 @@ function isPrivateIpv4(ip) {
 }
 function roomFromIp(ip) {
   if (!ip) return 'default';
-  if (ip === '::1' || ip.startsWith('127.')) return 'local';
+  if (ip === '::1' || ip.startsWith('127.')) {
+    // 环回访问（localhost/127.0.0.1）：和本机局域网 IP 分到同一 /24 组，
+    // 让电脑用 localhost 打开的页面也能与手机扫码的局域网设备互见
+    if (LAN_IP && isPrivateIpv4(LAN_IP)) return 'lan-' + LAN_IP.split('.').slice(0, 3).join('.');
+    return 'local';
+  }
   if (ip.includes(':')) { // IPv6 → /64 前缀
     const g = ip.split(':').slice(0, 4).join(':');
     return 'v6-' + g;
