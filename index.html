@@ -50,6 +50,10 @@
   .peer .badge{position:absolute;top:-8px;right:-8px;background:var(--blue);color:#fff;font-size:10px;
     padding:2px 7px;border-radius:12px;display:none}
   .peer.sel .badge{display:block}
+  .peer .warn{position:absolute;bottom:-7px;left:50%;transform:translateX(-50%);background:#fff3e0;color:#b9780a;
+    font-size:10px;padding:1px 8px;border-radius:10px;white-space:nowrap;border:1px solid #ffe0b2;display:none}
+  .peer.warn .warn{display:block}
+  .peer.warn{border-color:#ffcd7a;background:#fffaf0}
   .empty{color:var(--gray);font-size:12.5px;text-align:center;padding:14px 0}
   #activity{display:flex;flex-direction:column;gap:10px}
   .tcard{border:1px solid var(--line);border-radius:12px;padding:11px;background:#fff}
@@ -258,6 +262,15 @@
   async function computeNetKey(){
     const [pub, locals] = await Promise.all([fetchPubIp(), getLocalIps()]);
     const subnet = locals.length ? locals[0].split('.').slice(0,3).join('.')+'.0' : '';
+    // 多网卡 / VPN / 热点 场景下本机可能同时在多个私有网段，把所有 /24 前缀都收集起来去重
+    // 这样 A 端的 locals[0]=热点192.168.43.x、locals[1]=WiFi192.168.1.x 时，只要 B 端命中任一网段就算真·同 LAN
+    const subnetSet = new Set();
+    for (const ip of locals){
+      const p = (ip||'').split('.');
+      if (p.length===4) subnetSet.add(p.slice(0,3).join('.')+'.0');
+    }
+    if (subnet) subnetSet.add(subnet); // 兜底保持与主 key 一致
+    const subnets = [...subnetSet].slice(0, 6);
     // 主 key：仍然按 出口IP|子网 优先（若拿到公网 IP）
     const mainBase = pub ? (pub + '|' + subnet) : ('subnet-only|' + subnet);
     const mainKey = hashStr(mainBase).slice(0,12);
@@ -272,9 +285,9 @@
     if (mainKey) keys.push(mainKey);
     if (fallbackKey && fallbackKey!==mainKey) keys.push(fallbackKey);
     // 始终订阅 globalKey 兜底（解决安卓/iOS/PC 一端拿不到 subnet 导致互不可见的问题）
-    // 同 LAN 过滤靠 hello 里的 subnet 字段完成（非同一 LAN 且非手动 room 不展示）
+    // 同 LAN 软判断靠 hello 里的 subnets 集合完成（无交集的保留显示但加"可能跨网段"角标，不再硬丢弃）
     if (globalKey && !keys.includes(globalKey)) keys.push(globalKey);
-    return { key: mainKey, keys, fallbackKey, globalKey, pub, subnet, locals };
+    return { key: mainKey, keys, fallbackKey, globalKey, pub, subnet, subnets, locals };
   }
 
   // ---------- 极简 MQTT over WebSocket 客户端(仅 CONNECT/PUBLISH/SUBSCRIBE/PING) ----------
@@ -374,12 +387,17 @@
     const arrKeys = [...keys];
     const bases = arrKeys.map(k => 'landrop/' + k + '/');
     window.__rooms = arrKeys.slice(); // 调试可见
-    const presence = new Map();     // uid -> {uid,name,kind,ts}
+    const presence = new Map();     // uid -> {uid,name,kind,ts,warnLan,subnets}
     let mqtt=null, helloTimer=null, pruneTimer=null, watchdog=null, connected=false;
     const stopTimers = ()=>{ clearInterval(helloTimer); clearInterval(pruneTimer); clearTimeout(watchdog); };
     function refreshPeers(){
       const now=Date.now(), list=[];
-      for (const [k,v] of presence){ if(now-v.ts<15000) list.push({uid:v.uid,name:v.name,kind:v.kind}); else presence.delete(k); }
+      // prune 超时放宽到 20s（原来 15s），减少 MQTT 抖动导致的临时掉设备；
+      // warnLan 字段透传给 onPeers → renderPeers，用来在卡片上打黄色"可能跨网段"角标
+      for (const [k,v] of presence){
+        if(now-v.ts<20000) list.push({uid:v.uid,name:v.name,kind:v.kind,warnLan:!!v.warnLan});
+        else presence.delete(k);
+      }
       onPeers(list);
     }
     // 判断某 topic 是否命中任一 base + 指定子路径，并返回本地 uid 子段（对 sig/relay 需要）
@@ -390,6 +408,16 @@
       }
       return null;
     }
+    // 判断两端 subnets（数组或逗号串）是否存在至少一个公共 /24 前缀
+    function subnetsIntersect(aArr, bArr){
+      if (!aArr || !bArr) return false;
+      const A = Array.isArray(aArr)? aArr : String(aArr||'').split(',').filter(Boolean);
+      const B = Array.isArray(bArr)? bArr : String(bArr||'').split(',').filter(Boolean);
+      const setA = new Set(A.map(s=>String(s)).filter(Boolean));
+      if (!setA.size) return false;
+      for (const s of B){ const k=String(s||'').trim(); if (k && setA.has(k)) return true; }
+      return false;
+    }
     window.__mqtt = { topics: [], pub: 0, connected: false, broker: url, keys: arrKeys.slice() };
     mqtt = mqttConnect(url, (topic,payload)=>{
       if (window.__mqtt){ window.__mqtt.topics.push(topic.slice(0,80)); if(window.__mqtt.topics.length>40) window.__mqtt.topics.shift(); }
@@ -398,20 +426,22 @@
       // hello：任一 base 的 hello/<uid> 命中都接收并合并进 presence（跨 key 去重靠 uid）
       const helloUid = matchTopic(topic, 'hello/');
       if (helloUid!==null && obj.uid && obj.uid!==uid){
-        // 同 LAN 过滤逻辑：
-        //   1) 手动指定了 ?room= → 全部放行（用户明确希望在一组）
-        //   2) 两端 subnet 都非空且相同 → 同一 LAN，放行
-        //   3) 至少一方 subnet 为空（例如 iOS 获取不到本地 IP）→ 放行（避免过度严格导致真同 LAN 也看不见）
-        //   4) 其他情况（两边都非空但不同）→ 丢弃，防止 globalKey 把全网陌生人都显示出来
-        const mySubnet = (netKeyInfo && netKeyInfo.subnet) || '';
-        const theirSubnet = (obj && obj.subnet) ? String(obj.subnet) : '';
-        const sameLan = (!!room)
-          || (mySubnet==='' || theirSubnet==='')
-          || (mySubnet===theirSubnet);
-        if (sameLan){
-          presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now()});
-          refreshPeers();
+        // 同 LAN 软判断（不再硬丢弃，只做 warnLan 标记）：
+        //   1) 手动 ?room= → 明确同组，warnLan=false
+        //   2) subnets 集合存在交集（任一方为空也算命中，避免 iOS 拿不到本地 IP 误伤）→ 真·同 LAN，warnLan=false
+        //   3) 否则：仍加入 presence 让用户能选到，但 warnLan=true 加角标
+        // 这样修复「安卓能准确拿到 subnet 导致硬过滤太严、iOS 因拿不到反而全看得到」的不对称问题
+        const mySubs = (netKeyInfo && (netKeyInfo.subnets || (netKeyInfo.subnet?[netKeyInfo.subnet]:[]))) || [];
+        const theirSubsRaw = obj.subnets || (obj.subnet?[String(obj.subnet)]:[]);
+        const theirSubs = Array.isArray(theirSubsRaw)? theirSubsRaw : String(theirSubsRaw||'').split(',').filter(Boolean);
+        let warnLan = false;
+        if (!room){
+          const emptySide = !mySubs.length || !theirSubs.length;
+          const intersect = !emptySide && subnetsIntersect(mySubs, theirSubs);
+          if (!emptySide && !intersect) warnLan = true;
         }
+        presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now(),warnLan});
+        refreshPeers();
         return;
       }
       // sig：本设备 uid 才处理
@@ -430,12 +460,22 @@
       window.__mqtt.connected = true;
       window.__mqttApi = mqtt;
       // hello：向每一套 base 都发布，保证在不同 key 的设备都能看到我
+      // 携带完整 subnets 数组（多网卡 / VPN / 热点场景），接收端用集合交集判断是否真·同 LAN
       const say = ()=>{
         if(window.__mqtt) window.__mqtt.pub += bases.length;
-        const payload = JSON.stringify({uid, name:myName, kind:myKind, subnet:(netKeyInfo&&netKeyInfo.subnet)||''});
+        const subs = (netKeyInfo && (netKeyInfo.subnets || (netKeyInfo.subnet?[netKeyInfo.subnet]:[]))) || [];
+        const payload = JSON.stringify({
+          uid, name:myName, kind:myKind,
+          subnet: subs[0]||'',
+          subnets: subs
+        });
         bases.forEach(b=>mqtt.pub(b+'hello/'+uid, payload));
       };
-      setTimeout(say, 300); helloTimer=setInterval(say,5000);
+      // 300ms 首轮 + 2s 补发一轮（给晚订阅 / 晚打开的对方追上）+ 8s 再补发一轮，然后每 5s 周期心跳
+      setTimeout(say, 300);
+      setTimeout(say, 2000);
+      setTimeout(say, 8000);
+      helloTimer=setInterval(say,5000);
       pruneTimer=setInterval(refreshPeers,3000);
       // 纯静态 / MQTT 模式也需要生成二维码
       fillEntry({});
@@ -508,7 +548,12 @@
     try {
       if (transport && transport.kind === 'mqtt'){
         const mqtt = window.__mqttApi;
-        const payload = JSON.stringify({uid, name:myName, kind:myKind, subnet:(netKeyInfo&&netKeyInfo.subnet)||''});
+        const subs = (netKeyInfo && (netKeyInfo.subnets || (netKeyInfo.subnet?[netKeyInfo.subnet]:[]))) || [];
+        const payload = JSON.stringify({
+          uid, name:myName, kind:myKind,
+          subnet: subs[0]||'',
+          subnets: subs
+        });
         // 向所有当前订阅的 bases 各发一次，保证跨 key 都能收到
         const arrKeys = (netKeyInfo && netKeyInfo.keys && netKeyInfo.keys.length) ? netKeyInfo.keys.slice() : (room?[room]:[]);
         if (mqtt && mqtt.pub) arrKeys.forEach(k=>{
@@ -639,10 +684,11 @@
     $('#peerCount').textContent = '发现 ' + arr.length + ' 台';
     if (!arr.length){ peersEl.innerHTML = '<div class="empty">未在同一房间发现其他设备，确认对方也打开了本页</div>'; updateSendBtn(); return; }
     peersEl.innerHTML = arr.map(p => `
-      <div class="peer${state.selected===p.uid?' sel':''}" data-uid="${p.uid}">
+      <div class="peer${state.selected===p.uid?' sel':''}${p.warnLan?' warn':''}" data-uid="${p.uid}">
         <span class="ic">${KIND_ICON[p.kind]||'📡'}</span>
         <div><div class="pn">${esc(p.name)}</div><div class="pk">${p.kind==='phone'?'手机':'电脑'}</div></div>
         <span class="badge">已选</span>
+        <span class="warn">⚠️ 可能跨网段</span>
       </div>`).join('');
     peersEl.querySelectorAll('.peer').forEach(el=>{
       el.onclick = () => { state.selected = el.dataset.uid; renderPeers(); updateSendBtn(); };
