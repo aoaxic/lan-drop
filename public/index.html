@@ -271,7 +271,9 @@
     const keys = [];
     if (mainKey) keys.push(mainKey);
     if (fallbackKey && fallbackKey!==mainKey) keys.push(fallbackKey);
-    if (subnet==='' && globalKey && !keys.includes(globalKey)) keys.push(globalKey);
+    // 始终订阅 globalKey 兜底（解决安卓/iOS/PC 一端拿不到 subnet 导致互不可见的问题）
+    // 同 LAN 过滤靠 hello 里的 subnet 字段完成（非同一 LAN 且非手动 room 不展示）
+    if (globalKey && !keys.includes(globalKey)) keys.push(globalKey);
     return { key: mainKey, keys, fallbackKey, globalKey, pub, subnet, locals };
   }
 
@@ -396,7 +398,20 @@
       // hello：任一 base 的 hello/<uid> 命中都接收并合并进 presence（跨 key 去重靠 uid）
       const helloUid = matchTopic(topic, 'hello/');
       if (helloUid!==null && obj.uid && obj.uid!==uid){
-        presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now()}); refreshPeers();
+        // 同 LAN 过滤逻辑：
+        //   1) 手动指定了 ?room= → 全部放行（用户明确希望在一组）
+        //   2) 两端 subnet 都非空且相同 → 同一 LAN，放行
+        //   3) 至少一方 subnet 为空（例如 iOS 获取不到本地 IP）→ 放行（避免过度严格导致真同 LAN 也看不见）
+        //   4) 其他情况（两边都非空但不同）→ 丢弃，防止 globalKey 把全网陌生人都显示出来
+        const mySubnet = (netKeyInfo && netKeyInfo.subnet) || '';
+        const theirSubnet = (obj && obj.subnet) ? String(obj.subnet) : '';
+        const sameLan = (!!room)
+          || (mySubnet==='' || theirSubnet==='')
+          || (mySubnet===theirSubnet);
+        if (sameLan){
+          presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now()});
+          refreshPeers();
+        }
         return;
       }
       // sig：本设备 uid 才处理
@@ -417,7 +432,7 @@
       // hello：向每一套 base 都发布，保证在不同 key 的设备都能看到我
       const say = ()=>{
         if(window.__mqtt) window.__mqtt.pub += bases.length;
-        const payload = JSON.stringify({uid, name:myName, kind:myKind});
+        const payload = JSON.stringify({uid, name:myName, kind:myKind, subnet:(netKeyInfo&&netKeyInfo.subnet)||''});
         bases.forEach(b=>mqtt.pub(b+'hello/'+uid, payload));
       };
       setTimeout(say, 300); helloTimer=setInterval(say,5000);
@@ -492,10 +507,14 @@
     // 名称变化后立刻再发一次 hello（MQTT / WS 都兼容）
     try {
       if (transport && transport.kind === 'mqtt'){
-        const base = 'landrop/' + room + '/';
         const mqtt = window.__mqttApi;
-        const payload = JSON.stringify({uid, name:myName, kind:myKind});
-        if (mqtt && mqtt.pub) mqtt.pub(base+'hello/'+uid, payload);
+        const payload = JSON.stringify({uid, name:myName, kind:myKind, subnet:(netKeyInfo&&netKeyInfo.subnet)||''});
+        // 向所有当前订阅的 bases 各发一次，保证跨 key 都能收到
+        const arrKeys = (netKeyInfo && netKeyInfo.keys && netKeyInfo.keys.length) ? netKeyInfo.keys.slice() : (room?[room]:[]);
+        if (mqtt && mqtt.pub) arrKeys.forEach(k=>{
+          const base = 'landrop/' + k + '/';
+          mqtt.pub(base+'hello/'+uid, payload);
+        });
       } else if (state.ws && state.ws.readyState===1){
         state.ws.send(JSON.stringify({ type:'hello', room, name:myName, kind:myKind }));
       }
@@ -727,22 +746,19 @@
 
   function fallbackToRelay(o, target, markReady){
     if (o.useRelay) return;
-    // 公共信令模式没有服务器可中转，直接给出明确失败原因
-    if (transport && transport.kind === 'mqtt'){
-      o.useRelay = true; o.mode = 'relay';
-      try { o.dc && o.dc.close(); } catch(e){}
-      try { o.pc && o.pc.close(); } catch(e){}
-      o.pc = null; o.dc = null;
-      o.status = 'failed';
-      o.error = '点对点直连失败（可能被路由器 AP 隔离）。公共信令模式无服务器中转，请改用自建服务模式。';
-      markReady(); return;
-    }
     o.useRelay = true; o.mode='relay';
+    // 信令对端切到中转模式（WS 模式有 echo，MQTT 模式虽无 echo 但不影响——接收端 onRelay 是懒创建 recvGroup 的）
     try { signalTo(target.uid, { kind:'relay-mode' }); } catch(e){}
     try { o.dc && o.dc.close(); } catch(e){}
     try { o.pc && o.pc.close(); } catch(e){}
-    o.pc=null; o.dc=null;
-    o.status='idle';
+    o.pc = null; o.dc = null;
+    // MQTT 模式下也支持中转（通过 broker 转发 base64 分片，文件越小越好；大文件强烈建议自建 WS 服务器）
+    if (transport && transport.kind === 'mqtt'){
+      o.relay = true; o._mqttRelay = true; o.status = 'idle';
+      toast('P2P 直连受阻，已切换为公共信令中转（较慢，建议小文件使用）', 'warn');
+    } else {
+      o.relay = true; o.status = 'idle';
+    }
     markReady(); kickPending(o);
   }
   function kickPending(o){ if (o._pendingJob){ const j=o._pendingJob; o._pendingJob=null; runJob(o, j); } }
@@ -1000,7 +1016,11 @@
     const stMap = { connecting:['连接中…','blue pulse'], idle:['就绪','gray'], sending:['传输中','blue pulse'],
       receiving:['接收中','blue pulse'], done:['完成','green'], failed:['失败','red'], canceled:['已取消','red'], interrupted:['中断','red'] };
     const [stTxt,stCls] = stMap[ref.status]||['…','gray'];
-    const relay = ref.useRelay || ref.relay ? '<span class="relayTag">经服务器中转</span>' : '';
+    const relay = (ref.useRelay || ref.relay)
+      ? (ref._mqttRelay
+          ? '<span class="relayTag" style="background:#e7efff;color:#1d4fd6">公共信令中转（较慢）</span>'
+          : '<span class="relayTag">经服务器中转</span>')
+      : '';
     let speed='';
     if (ref.job && ref.status==='sending'){
       const dt=(Date.now()-ref._t0)/1000; const sp=dt>0?done/dt:0;
