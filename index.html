@@ -17,6 +17,12 @@
   header{position:sticky;top:0;z-index:30;background:linear-gradient(120deg,#2f6bff,#5b8bff);color:#fff;
     padding:14px 16px;display:flex;align-items:center;gap:12px;box-shadow:var(--shadow)}
   header h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.5px}
+  header .me{font-size:13px;background:rgba(255,255,255,.15);padding:5px 10px;border-radius:20px;white-space:nowrap;cursor:pointer;
+    display:flex;align-items:center;gap:6px;border:1px solid rgba(255,255,255,.18);transition:.15s;user-select:none;max-width:38vw}
+  header .me:hover{background:rgba(255,255,255,.28)}
+  header .me .mic{font-size:14px}
+  header .me .mnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:130px;font-weight:600}
+  header .me .med{opacity:.8;font-size:10.5px;padding-left:2px}
   header .net{margin-left:auto;font-size:12.5px;background:rgba(255,255,255,.18);padding:5px 10px;border-radius:20px;white-space:nowrap}
   .wrap{max-width:760px;margin:0 auto;padding:14px 14px 40px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
@@ -89,6 +95,11 @@
 <body>
 <header>
   <h1>⚡ LAN Drop</h1>
+  <div class="me" id="meBox" title="点击修改本机名称">
+    <span class="mic" id="meIcon">💻</span>
+    <span class="mnm" id="meName">我</span>
+    <span class="med" id="meEdit">✎</span>
+  </div>
   <span class="net" id="net">连接中…</span>
   <button class="btn ghost" id="qrBtn" style="padding:6px 12px;font-size:12px">📷 扫码</button>
 </header>
@@ -176,7 +187,8 @@
   const $ = s => document.querySelector(s);
   const netEl = $('#net'), peersEl = $('#peers'), fileListEl = $('#fileList'),
         activityEl = $('#activity'), dropEl = $('#drop'), fileInput = $('#fileInput'),
-        sendBtn = $('#sendBtn'), selInfo = $('#selInfo'), toastEl = $('#toast');
+        sendBtn = $('#sendBtn'), selInfo = $('#selInfo'), toastEl = $('#toast'),
+        meNameEl = $('#meName'), meIconEl = $('#meIcon'), meBoxEl = $('#meBox');
 
   function toast(msg, kind){ toastEl.textContent=msg; toastEl.className='toast show'+(kind?' '+kind:'');
     clearTimeout(toast._t); toast._t=setTimeout(()=>toastEl.className='toast',2600); }
@@ -349,10 +361,13 @@
       mqtt.sub(base+'#');
       state.myId = uid; window.__uid = uid;
       window.__mqtt.connected = true;
+      window.__mqttApi = mqtt;
       // CONNACK 后稍等再发 hello，确保订阅已在 broker 生效
       const say = ()=>{ if(window.__mqtt) window.__mqtt.pub++; mqtt.pub(base+'hello/'+uid, JSON.stringify({uid, name:myName, kind:myKind})); };
       setTimeout(say, 300); helloTimer=setInterval(say,5000);
       pruneTimer=setInterval(refreshPeers,3000);
+      // 纯静态 / MQTT 模式也需要生成二维码
+      fillEntry({});
     }, ()=>{
       stopTimers();
       if (connected){ setNet('公共信令断开，重连中…'); setTimeout(connect,2000); return; }
@@ -397,6 +412,78 @@
   }
   function setNet(t){ state.net=t; netEl.textContent=t; }
 
+  // ---------- 本机身份名称渲染 + 点击编辑 ----------
+  function renderMe(){
+    if (!meNameEl) return;
+    meNameEl.textContent = myName;
+    meIconEl.textContent = KIND_ICON[myKind] || '📡';
+    document.title = myName + ' · LAN Drop';
+  }
+  function broadcastMyName(){
+    // 名称变化后立刻再发一次 hello（MQTT / WS 都兼容）
+    try {
+      if (transport && transport.kind === 'mqtt'){
+        const base = 'landrop/' + room + '/';
+        const mqtt = window.__mqttApi;
+        const payload = JSON.stringify({uid, name:myName, kind:myKind});
+        if (mqtt && mqtt.pub) mqtt.pub(base+'hello/'+uid, payload);
+      } else if (state.ws && state.ws.readyState===1){
+        state.ws.send(JSON.stringify({ type:'hello', room, name:myName, kind:myKind }));
+      }
+    } catch(e){}
+  }
+  function promptForName(cb){
+    // 用 inline input 代替原生 prompt，体验更好，也不阻塞在自动化/移动端场景
+    if (meBoxEl){
+      const oldHTML = meBoxEl.innerHTML;
+      const input = document.createElement('input');
+      input.type = 'text'; input.value = myName; input.maxLength = 24;
+      input.style.cssText = 'background:rgba(255,255,255,.95);color:var(--ink);border:none;border-radius:14px;' +
+        'padding:3px 8px;font-size:13px;font-weight:600;outline:none;width:140px';
+      meBoxEl.innerHTML = '';
+      const icon = document.createElement('span'); icon.className='mic'; icon.textContent=KIND_ICON[myKind]||'📡';
+      meBoxEl.appendChild(icon);
+      meBoxEl.appendChild(input);
+      input.focus(); input.select();
+      function commit(cancel){
+        const v = cancel ? null : String(input.value||'').trim().slice(0,24);
+        try { input.removeEventListener('blur', onBlur);
+          input.removeEventListener('keydown', onKey); } catch(_e){}
+        // 先恢复结构，再由 cb → renderMe() 统一重绘名称，确保显示一致
+        meBoxEl.innerHTML = oldHTML;
+        cb(v);
+        // 如果 cb 里没有触发 renderMe（取消/无效输入），这里手动再画一次
+        renderMe();
+      }
+      function onBlur(){ commit(false); }
+      function onKey(ev){
+        if (ev.key==='Enter'){ ev.preventDefault(); commit(false); }
+        else if (ev.key==='Escape'){ ev.preventDefault(); commit(true); }
+      }
+      input.addEventListener('blur', onBlur);
+      input.addEventListener('keydown', onKey);
+    } else {
+      // Fallback to prompt
+      const v = window.prompt('修改本机名称（其他设备会看到这个名字）', myName);
+      cb(v===null ? null : String(v).trim().slice(0,24));
+    }
+  }
+  function doEditMyName(){
+    promptForName(function(name){
+      if (name===null || name==='' || name===myName) return;
+      myName = name;
+      ss.setItem('land_name', myName);
+      renderMe();
+      broadcastMyName();
+      toast('本机名称已更新：' + myName, 'ok');
+    });
+  }
+  window.__editMyName = doEditMyName;
+  if (meBoxEl){
+    meBoxEl.addEventListener('click', doEditMyName);
+  }
+  renderMe();
+
   function updateNetUI(){
     const el = $('#entryHint'); if (!el) return;
     if (transport && transport.kind === 'mqtt'){
@@ -412,13 +499,39 @@
   }
 
   function fillEntry(info){
+    info = info || {};
     // 公网部署（域名/公网 IP 访问）时二维码就是当前网址；本地部署时用局域网 IP
     const host = location.hostname;
     const isLocal = host === 'localhost' || host === '127.0.0.1' || /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(host) || /\.local$/.test(host);
-    const url = isLocal ? `http://${info.lanIp}:${info.port}` : location.origin;
-    $('#hintLocal').textContent = location.href;
-    $('#hintMdns').textContent = isLocal ? `http://${info.mdns}:${info.port}` : location.origin;
-    const qr = $('#qrImg'); qr.src = '/api/qr?text=' + encodeURIComponent(url); $('#qrUrl').textContent = url;
+    let url = location.origin + location.pathname;
+    let mdnsHint = location.origin;
+    if (isLocal && info.lanIp){
+      const port = info.port || location.port || (location.protocol==='https:'?'443':'80');
+      url = (location.protocol==='https:'?'https://':'http://') + info.lanIp + ':' + port + location.pathname;
+      mdnsHint = info.mdns ? ((location.protocol==='https:'?'https://':'http://') + info.mdns + ':' + port + location.pathname) : url;
+    } else if (isLocal && (netKeyInfo && netKeyInfo.locals && netKeyInfo.locals.length)){
+      // MQTT / 纯静态模式下拿到了本机局域网 IP，就用局域网 IP 生成二维码（手机扫了就连同一个局域网地址）
+      const lanIp = netKeyInfo.locals[0];
+      const port = location.port || (location.protocol==='https:'?'443':'80');
+      url = (location.protocol==='https:'?'https://':'http://') + lanIp + ':' + port + location.pathname;
+      mdnsHint = url;
+    }
+    // 带 room 参数，保证扫二维码进入的设备和当前设备一定在同一房间
+    try {
+      const u = new URL(url, location.href);
+      if (room) u.searchParams.set('room', room);
+      url = u.toString();
+    } catch(e){}
+    $('#hintLocal') && ($('#hintLocal').textContent = location.href);
+    $('#hintMdns') && ($('#hintMdns').textContent = mdnsHint);
+    const qr = $('#qrImg'); const qrUrl = $('#qrUrl');
+    if (qrUrl) qrUrl.textContent = url;
+    // 优先使用本服务自带的 /api/qr（WS 模式）；否则使用公共 QR 服务（MQTT / 纯静态模式可用）
+    const useLocalQr = (typeof info.lanIp !== 'undefined') && (transport && transport.kind==='ws');
+    const qrSrc = useLocalQr
+      ? ('/api/qr?text=' + encodeURIComponent(url))
+      : ('https://api.qrserver.com/v1/create-qr-code/?size=260x260&margin=8&data=' + encodeURIComponent(url));
+    if (qr){ qr.src = qrSrc; qr.alt = url; }
   }
 
   function onPeers(list){
@@ -561,7 +674,11 @@
   function kickPending(o){ if (o._pendingJob){ const j=o._pendingJob; o._pendingJob=null; runJob(o, j); } }
 
   async function runJob(o, fileRefs){
-    if (o.status!=='idle' && o.status!=='connecting'){ o._pendingJob=fileRefs; return; }
+    // 完成过的任务（done）与就绪（idle）、连接中（connecting）都允许开启新任务；
+    // 只有真正正在发送（sending）/失败（failed）时才走 pending 队列（发送中会在结束时 kickPending）
+    if (o.status==='sending' || o.status==='receiving'){ o._pendingJob=fileRefs; return; }
+    if (o.status==='failed' || o.status==='canceled' || o.status==='interrupted'){ o._pendingJob=fileRefs; return; }
+    // idle / connecting / done → 均可直接开始新任务
     o.status='sending'; o._t0=Date.now(); o._sent=0;
     const files = fileRefs.map(f=>({ fileId:f.id, file:f.file, name:f.name, size:f.size, type:f.type, acked:0, row:null }));
     o.job = { files, total: files.reduce((s,f)=>s+f.size,0), sent:0 };
@@ -570,9 +687,15 @@
       if (o.mode==='relay') await sendRelayFile(o, f);
       else await sendP2PFile(o, f);
     }
-    o.status='done';
+    const hadErr = !o.job.files.every(f=>(f.acked||0)>=f.size);
+    // 一轮传输完成：若有正在等待的下一批，先复位为 idle 再 kickPending，
+    // 否则停在 idle（允许用户后续任意次点击发送继续复用通道）
+    o.status = hadErr ? 'failed' : 'idle';
+    if (!hadErr) o.job = null; // 清空已完成 job，下一轮重新构建（避免旧文件行占槽）
     updateProgress(o);
-    toast('✅ 已发送给「'+o.target.name+'」','ok');
+    if (!hadErr) toast('✅ 已发送给「'+o.target.name+'」','ok');
+    else toast('⚠️ 部分文件未完成发送','warn');
+    kickPending(o);
   }
 
   async function sendP2PFile(o, f){
