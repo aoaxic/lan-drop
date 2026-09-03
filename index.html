@@ -208,29 +208,47 @@
   }
   function getLocalIps(){
     return new Promise(res=>{
-      const ips=new Set(); let pc=null;
+      const ips=new Set(); let pc=null, settled=false;
+      function finish(){ if(settled) return; settled=true;
+        try{ pc&&pc.close(); }catch(e){} res([...ips]); }
       try {
-        pc=new RTCPeerConnection({ iceServers:[] });
+        // iOS 17+ 对空 iceServers 的 PeerConnection 不派发 srflx 候选；同时尽力用 iceServers 空集合也能拿到 host 候选
+        pc=new RTCPeerConnection({ iceServers: FALLBACK_STUN });
         pc.createDataChannel('probe');
         pc.onicecandidate=e=>{
           const c=e.candidate&&e.candidate.candidate;
-          if(c){ const m=/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(c); if(m&&isPrivate(m[1])) ips.add(m[1]); }
+          if(c){
+            // host 候选(typ host)与 srflx 候选(typ srflx)里的私有地址都收集
+            const m=/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(c);
+            if(m && isPrivate(m[1])) ips.add(m[1]);
+          }
+          if (e.candidate===null) finish();
+        };
+        pc.onicegatheringstatechange = ()=>{
+          const s = pc.iceGatheringState;
+          if (s==='complete') finish();
         };
         pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>{});
       } catch(e){}
-      setTimeout(()=>{ try{ pc&&pc.close(); }catch(e){} res([...ips]); }, 1500);
+      // 兜底：1.8s 后必然返回（比 1.5s 稍宽，等 iOS srflx 再长一点）
+      setTimeout(finish, 1800);
     });
   }
   async function fetchPubIp(){
+    // 缩短到每源 2.5s 超时，多两个候选（Cloudflare / ipinfo），保证移动端也能命中
     const cands=[
       ['https://icanhazip.com', r=>r.text().then(s=>(s||'').trim())],
-      ['https://api.ipify.org?format=json', r=>r.json().then(j=>(j.ip||'').trim())]
+      ['https://api.ipify.org?format=json', r=>r.json().then(j=>(j.ip||'').trim())],
+      ['https://cloudflare.com/cdn-cgi/trace', r=>r.text().then(t=>{
+        const m=/ip=(\d{1,3}(?:\.\d{1,3}){3})/.exec(t||''); return m?m[1]:'';
+      })],
+      ['https://ipinfo.io/json', r=>r.json().then(j=>((j.ip||'')+'').trim())]
     ];
     for (const [u,fn] of cands){
       try {
         const v = await Promise.race([
           fetch(u,{cache:'no-store'}).then(fn),
-          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),5000))
+          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),2500))
         ]);
         if (v && /^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return v;
       } catch(e){}
@@ -240,12 +258,21 @@
   async function computeNetKey(){
     const [pub, locals] = await Promise.all([fetchPubIp(), getLocalIps()]);
     const subnet = locals.length ? locals[0].split('.').slice(0,3).join('.')+'.0' : '';
-    // 分组优先级：
-    //  1) 双方都拿到了公网出口 IP → 按 出口IP|子网 精确分组（同出口=同局域网，最可靠）
-    //  2) 任意一方没拿到公网 IP（部分手机/网络环境 API 被拦截）→ 退化为只按子网前缀分组，
-    //     保证同一 192.168.x / 10.x / 172.16-31.x 子网的设备一定能互见
-    const base = pub ? (pub + '|' + subnet) : ('subnet-only|' + subnet);
-    return { key: hashStr(base).slice(0,12), pub, subnet, locals };
+    // 主 key：仍然按 出口IP|子网 优先（若拿到公网 IP）
+    const mainBase = pub ? (pub + '|' + subnet) : ('subnet-only|' + subnet);
+    const mainKey = hashStr(mainBase).slice(0,12);
+    // 新增：子网兜底 key（只按子网前缀分组，不看公网 IP → 保证 iOS/Android/PC 只要同子网就一定在同一兜底房间）
+    // 解决：A 端拿到公网 IP、B 端没拿到 → 主 key 不同导致互不可见
+    const fallbackBase = 'subnet-only|' + subnet;
+    const fallbackKey = hashStr(fallbackBase).slice(0,12);
+    // 再新增：全量兜底 key（空子网时用；极端情况下所有设备都在同一全局房间，便于手机用流量也能通过手动 ?room= 覆盖）
+    const globalBase = 'global|any';
+    const globalKey = hashStr(globalBase).slice(0,12);
+    const keys = [];
+    if (mainKey) keys.push(mainKey);
+    if (fallbackKey && fallbackKey!==mainKey) keys.push(fallbackKey);
+    if (subnet==='' && globalKey && !keys.includes(globalKey)) keys.push(globalKey);
+    return { key: mainKey, keys, fallbackKey, globalKey, pub, subnet, locals };
   }
 
   // ---------- 极简 MQTT over WebSocket 客户端(仅 CONNECT/PUBLISH/SUBSCRIBE/PING) ----------
@@ -333,8 +360,19 @@
     brokerIdx = brokerIdx || 0;
     const url = MQTT_BROKERS[brokerIdx % MQTT_BROKERS.length];
     setNet('正在连接公共信令…');
-    const base = 'landrop/' + room + '/';
-    const presence = new Map();
+    // 支持多 key 并发订阅：
+    //  1) 显式 ?room= → 强制加入的主 key
+    //  2) 自动算出的主 key + subnet-only fallback key
+    //  3) 无子网场景的全局兜底 key
+    // 效果：两端哪怕公网 IP 命中情况不同（一边拿到一边没拿到）、或一边手动 ?room= 一边没传，只要同子网就一定能互见
+    const autoKeys = (netKeyInfo && netKeyInfo.keys && netKeyInfo.keys.length) ? netKeyInfo.keys.slice() : [];
+    const keys = new Set();
+    if (room) keys.add(room);                // 手动覆盖优先：永远订阅它
+    autoKeys.forEach(k => keys.add(k));      // 自动计算出的主 key / fallback / 全局
+    const arrKeys = [...keys];
+    const bases = arrKeys.map(k => 'landrop/' + k + '/');
+    window.__rooms = arrKeys.slice(); // 调试可见
+    const presence = new Map();     // uid -> {uid,name,kind,ts}
     let mqtt=null, helloTimer=null, pruneTimer=null, watchdog=null, connected=false;
     const stopTimers = ()=>{ clearInterval(helloTimer); clearInterval(pruneTimer); clearTimeout(watchdog); };
     function refreshPeers(){
@@ -342,28 +380,46 @@
       for (const [k,v] of presence){ if(now-v.ts<15000) list.push({uid:v.uid,name:v.name,kind:v.kind}); else presence.delete(k); }
       onPeers(list);
     }
-    window.__mqtt = { topics: [], pub: 0, connected: false, broker: url };
+    // 判断某 topic 是否命中任一 base + 指定子路径，并返回本地 uid 子段（对 sig/relay 需要）
+    function matchTopic(topic, sub){
+      for (const b of bases){
+        const prefix = b + sub;
+        if (topic.indexOf(prefix)===0) return topic.slice(prefix.length);
+      }
+      return null;
+    }
+    window.__mqtt = { topics: [], pub: 0, connected: false, broker: url, keys: arrKeys.slice() };
     mqtt = mqttConnect(url, (topic,payload)=>{
-      if (window.__mqtt){ window.__mqtt.topics.push(topic.slice(0,60)); if(window.__mqtt.topics.length>40) window.__mqtt.topics.shift(); }
+      if (window.__mqtt){ window.__mqtt.topics.push(topic.slice(0,80)); if(window.__mqtt.topics.length>40) window.__mqtt.topics.shift(); }
       let obj=null; try{ obj=JSON.parse(payload); }catch(e){ return; }
       if (!obj) return;
-      if (topic.indexOf(base+'hello/')===0){
-        if (obj.uid && obj.uid!==uid){ presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now()}); refreshPeers(); }
-      } else if (topic.indexOf(base+'sig/')===0){
-        if (topic.slice((base+'sig/').length)===uid && obj.data) onSignal(obj.from, obj.name, obj.data);
-      } else if (topic.indexOf(base+'relay/')===0){
-        if (topic.slice((base+'relay/').length)===uid && obj.payload) onRelay(obj.from, obj.name, obj.payload);
+      // hello：任一 base 的 hello/<uid> 命中都接收并合并进 presence（跨 key 去重靠 uid）
+      const helloUid = matchTopic(topic, 'hello/');
+      if (helloUid!==null && obj.uid && obj.uid!==uid){
+        presence.set(obj.uid,{uid:obj.uid,name:obj.name,kind:obj.kind,ts:Date.now()}); refreshPeers();
+        return;
       }
+      // sig：本设备 uid 才处理
+      const sigTo = matchTopic(topic, 'sig/');
+      if (sigTo===uid && obj.data){ onSignal(obj.from, obj.name, obj.data); return; }
+      // relay：本设备 uid 才处理
+      const relayTo = matchTopic(topic, 'relay/');
+      if (relayTo===uid && obj.payload){ onRelay(obj.from, obj.name, obj.payload); return; }
     }, ()=>{
       if (connected) return;
       connected = true; clearTimeout(watchdog);
       setNet('已连接 · 等待设备');
-      mqtt.sub(base+'#');
+      // 订阅所有 key 下的通配（一般 broker 支持多次 SUBSCRIBE，分两次保险）
+      bases.forEach(b=>mqtt.sub(b+'#'));
       state.myId = uid; window.__uid = uid;
       window.__mqtt.connected = true;
       window.__mqttApi = mqtt;
-      // CONNACK 后稍等再发 hello，确保订阅已在 broker 生效
-      const say = ()=>{ if(window.__mqtt) window.__mqtt.pub++; mqtt.pub(base+'hello/'+uid, JSON.stringify({uid, name:myName, kind:myKind})); };
+      // hello：向每一套 base 都发布，保证在不同 key 的设备都能看到我
+      const say = ()=>{
+        if(window.__mqtt) window.__mqtt.pub += bases.length;
+        const payload = JSON.stringify({uid, name:myName, kind:myKind});
+        bases.forEach(b=>mqtt.pub(b+'hello/'+uid, payload));
+      };
       setTimeout(say, 300); helloTimer=setInterval(say,5000);
       pruneTimer=setInterval(refreshPeers,3000);
       // 纯静态 / MQTT 模式也需要生成二维码
@@ -385,8 +441,18 @@
       setTimeout(()=>connectMqtt(next), 1200);
     }, 9000);
     transport = { kind:'mqtt',
-      sendSignal:(to,data)=>{ mqtt.pub(base+'sig/'+to, JSON.stringify({from:uid,name:myName,data})); return Promise.resolve({ok:true}); },
-      sendRelay:(to,payload)=>{ mqtt.pub(base+'relay/'+to, JSON.stringify({from:uid,name:myName,payload})); } };
+      // signal / relay 也都向所有 base 各发一份，接收端 matchTopic 只会命中一次
+      sendSignal:(to,data)=>{
+        const payload = JSON.stringify({from:uid,name:myName,data});
+        bases.forEach(b=>mqtt.pub(b+'sig/'+to, payload));
+        if(window.__mqtt) window.__mqtt.pub += bases.length;
+        return Promise.resolve({ok:true});
+      },
+      sendRelay:(to,payload)=>{
+        const body = JSON.stringify({from:uid,name:myName,payload});
+        bases.forEach(b=>mqtt.pub(b+'relay/'+to, body));
+      }
+    };
     updateNetUI();
   }
 
@@ -394,20 +460,23 @@
   async function connect(){
     try {
       // WS 模式：房间由服务器按来源 IP 自动分配（无需客户端探测，任意网络可用）。
-      // 仅在走公共信令(MQTT，纯静态部署)时才需要客户端自己计算网络分组。
-      async function ensureMqttRoom(){
-        if (!room){
+      // MQTT / 纯静态部署时：无论用户有没有传 ?room= 覆盖，都要跑一遍 computeNetKey，
+      // 这样即使主 key 不同（一端拿公网 IP、另一端没拿到 / 显式 ?room=），
+      // 还有 subnet-only fallback key 和全局兜底，保证同局域网设备一定互见。
+      async function ensureNetKeyForFallback(){
+        if (!netKeyInfo){
           setNet('正在识别网络…');
           netKeyInfo = await computeNetKey();
-          room = netKeyInfo.key;
           window.__netKey = netKeyInfo;
+          // 没有手动 ?room= 覆盖时，主 key 就用算出来的 key
+          if (!room) room = netKeyInfo.key;
         }
       }
       const forced = QS.get('signal');
-      if (forced === 'mqtt'){ await ensureMqttRoom(); connectMqtt(); return; }
+      if (forced === 'mqtt'){ await ensureNetKeyForFallback(); connectMqtt(); return; }
       if (forced === 'ws'){ await connectWs(); return; }
       const ok = await connectWs();       // 先看是不是本项目 Node 服务
-      if (!ok){ await ensureMqttRoom(); connectMqtt(); }  // 否则走公共信令
+      if (!ok){ await ensureNetKeyForFallback(); connectMqtt(); }  // 否则走公共信令
     } catch(e){ setNet('连接失败：'+e.message); setTimeout(connect,3000); }
   }
   function setNet(t){ state.net=t; netEl.textContent=t; }
@@ -486,10 +555,15 @@
 
   function updateNetUI(){
     const el = $('#entryHint'); if (!el) return;
+    const kinfo = (netKeyInfo||{});
+    const keys = kinfo.keys || (kinfo.key?[kinfo.key]:[]);
+    const keyHtml = keys.length? ('· 分组Key：<b>' + keys.map(k=>esc(k)).join(' / ') + '</b>') : '';
+    const subnetHtml = kinfo.subnet ? (' · 子网 <b>'+esc(kinfo.subnet)+'</b>') : '';
+    const roomsHtml = (transport && transport.kind==='mqtt' && keys.length>1)
+      ? '<br>· 同局域网兜底订阅 '+keys.length+' 个分组（主Key+子网兜底Key），只要是同一 WiFi 的手机一定能互见' : '';
     if (transport && transport.kind === 'mqtt'){
       el.innerHTML = '🌐 <b>已按当前网络自动分组</b>：与你同一个局域网（相同公网出口）的设备会自动出现，其他网络的人看不到你。<br>' +
-        '· 当前出口 IP：<b>' + esc((netKeyInfo&&netKeyInfo.pub)||'未知') + '</b>' +
-        ((netKeyInfo&&netKeyInfo.subnet) ? ' · 内网网段 <b>'+esc(netKeyInfo.subnet)+'</b>' : '') + '<br>' +
+        '· 当前出口 IP：<b>' + esc(kinfo.pub||'未知（由同子网兜底Key保证互联）') + '</b>' + subnetHtml + keyHtml + roomsHtml + '<br>' +
         '· 通道：公共信令（无需自建服务器），文件仍走点对点直传';
     } else if (transport && transport.kind === 'ws'){
       el.innerHTML = '🌐 <b>服务器已按你的网络自动分组</b>：与你同一网络出口（同一局域网/同一宽带）的设备会自动出现，其他网络看不到你。<br>' +
@@ -737,7 +811,23 @@
   function failOut(o, msg){ o.status='failed'; o.error=msg; updateProgress(o); }
 
   // ---------- 接收侧 ----------
+  // 多 key 订阅时，signal/relay 会在不同 base topic 上收到相同载荷的副本。这里按「来源+kind+指纹」短时去重，避免多次 setRemoteDescription / addIceCandidate
+  const dedupSig = new Map(); // key -> expire ts
+  function seenSignalKey(from, data){
+    // 用 data 的 JSON 字符串前 80 字符 + kind 做近似指纹（offer/answer 很大，但 ICE 候选也很短，够用）
+    const kind = (data && data.kind) || 'x';
+    const tail = (typeof data==='string'? data : JSON.stringify(data||'')).slice(0,80);
+    const k = from + '|' + kind + '|' + tail;
+    const now = Date.now();
+    if (dedupSig.has(k) && dedupSig.get(k)>now) return true;
+    dedupSig.set(k, now + 30000);
+    if (dedupSig.size > 500){ // 定时清过期
+      for (const [kk,v] of dedupSig){ if (v<=now) dedupSig.delete(kk); }
+    }
+    return false;
+  }
   function onSignal(from, name, data){
+    if (seenSignalKey(from, data)) return;
     window.__sig = window.__sig || {};
     TR('onSignal:' + (data && data.kind));
     if (data && data.kind) window.__sig[data.kind] = (window.__sig[data.kind]||0)+1;
@@ -794,6 +884,13 @@
   }
 
   function onRelay(from, name, p){
+    // chunk 用 (kind, fileId, off, end) + ack 用 (kind, fileId, bytes) 做去重
+    const kind = p.kind||'x';
+    let rk = from+'|'+kind;
+    if (kind==='chunk') rk += '|'+p.fileId+'|'+p.off+'|'+(p.end?1:0)+'|'+(p.data||'').length;
+    else if (kind==='ack') rk += '|'+p.fileId+'|'+p.bytes;
+    else rk += '|'+(typeof p.payload==='string'?p.payload.slice(0,60):JSON.stringify(p||'').slice(0,60));
+    if (seenSignalKey('R'+rk, {kind:'relay'})) return;
     let g = state.recvGroups.get(from);
     if (!g) g = createRecvGroup(from, name, 'desktop');
     if (p.kind==='chunk'){
