@@ -1029,10 +1029,26 @@
 
   async function sendP2PFile(o, f){
     const dc = o.dc; if (!dc || dc.readyState!=='open'){ throw new Error('通道已断开'); }
+
+    // ★ 动态检测 maxMessageSize，防止 "send message larger than max-message-size" 错误
+    // iOS Safari 的 maxMessageSize 可能只有 64KB-120KB，256KB 直接超限
+    let effChunk = CHUNK;
+    try {
+      let mms = 0;
+      if (typeof dc.maxMessageSize === 'number') mms = dc.maxMessageSize;
+      else if (o.pc && o.pc.sctp && typeof o.pc.sctp.maxMessageSize === 'number') mms = o.pc.sctp.maxMessageSize;
+      if (mms > 0 && mms < CHUNK + 8) {
+        effChunk = Math.max(1024, Math.floor(mms) - 8); // 留 8 字节给 seq 头
+        TR('maxMessageSize=' + mms + ' → effChunk=' + effChunk + ' (was ' + CHUNK + ')');
+      }
+    } catch(e) { TR('mmsDetectErr:' + e.message); }
+    o._effChunk = effChunk; // 供 handleResend 引用
+
     const total = f.size;
-    const totalSeqs = Math.max(1, Math.ceil(total / CHUNK));
+    const totalSeqs = Math.max(1, Math.ceil(total / effChunk));
     const chunkCache = new Map();
-    dc.send(JSON.stringify({ kind:'meta', fileId:f.fileId, name:f.name, size:total, type:f.type, totalSeqs })); TR('out:meta');
+    // ★ meta 携带 chunkSize，接收端据此计算 totalSeqs（防不一致）
+    dc.send(JSON.stringify({ kind:'meta', fileId:f.fileId, name:f.name, size:total, type:f.type, totalSeqs, chunkSize: effChunk })); TR('out:meta effChunk='+effChunk);
     let off = 0, seq = 0, lastAckBytes = 0;
     f.acked = 0;
 
@@ -1104,7 +1120,7 @@
           throw new Error('通道已断开 (off='+off+', dc='+dc.readyState+', pc='+ (o.pc?o.pc.connectionState:'?') +')');
         }
 
-        const slice = f.file.slice(off, off + CHUNK);
+        const slice = f.file.slice(off, off + effChunk);
         const buf = await slice.arrayBuffer();
         const payload = new Uint8Array(8 + buf.byteLength);
         const dv = new DataView(payload.buffer, payload.byteOffset, 8);
@@ -1388,13 +1404,14 @@
     // 中转模式：保持 Uint8Array buf（chunk 自带 off 字段，直接 set 到对应位置）
     g.act = {
       fileId:m.fileId, size:m.size||0,
-      totalSeqs: Math.max(1, Math.ceil((m.size||0) / CHUNK)),
+      // ★ 优先用发送端 meta 中携带的 totalSeqs，其次用 chunkSize 计算，最后用全局 CHUNK
+      totalSeqs: m.totalSeqs || Math.max(1, Math.ceil((m.size||0) / (m.chunkSize || CHUNK))),
       seqMap: new Map(), buf: isRelay ? new Uint8Array(m.size||0) : null, cursor:0, lastAck:0,
       row, mode: isRelay?'relay':'p2p', _bytes:0, _deadlineTimer:null,
-      _g: g,                    // ★ 反向引用 group（deadline 回调里用）
-      _endSeen: false,          // ★ 是否已收到 end 消息
-      _resendCount: 0,         // ★ 已请求重传的轮数（防死循环）
-      _resendRequested: new Set() // ★ 已请求过的 seq 集合（防重复请求）
+      _g: g,
+      _endSeen: false,
+      _resendCount: 0,
+      _resendRequested: new Set()
     };
     if (g.status!=='receiving') g.status='receiving';
     scheduleDeadline(g.act);
