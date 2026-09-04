@@ -865,6 +865,8 @@
       if (settled) return;
       settled = true;
       o.status='failed'; o.error=msg; updateProgress(o);
+      // ★ 关键修复：必须 markReady，否则 ensureOut 永远 await readyP 卡死
+      markReady();
     }
     function setupPcAndDc(pc, dc, label){
       o.pc = pc; o.dc = dc;
@@ -997,74 +999,151 @@
   }
 
   async function runJob(o, fileRefs){
-    // 完成过的任务（done）与就绪（idle）、连接中（connecting）都允许开启新任务；
-    // 只有真正正在发送（sending）/失败（failed）时才走 pending 队列（发送中会在结束时 kickPending）
     if (o.status==='sending' || o.status==='receiving'){ o._pendingJob=fileRefs; return; }
     if (o.status==='failed' || o.status==='canceled' || o.status==='interrupted'){ o._pendingJob=fileRefs; return; }
-    // idle / connecting / done → 均可直接开始新任务
     o.status='sending'; o._t0=Date.now(); o._sent=0;
     const files = fileRefs.map(f=>({ fileId:f.id, file:f.file, name:f.name, size:f.size, type:f.type, acked:0, row:null }));
     o.job = { files, total: files.reduce((s,f)=>s+f.size,0), sent:0 };
+    let sendError = null;
     for (const f of files){
       const row = addFileRow(o, f); f.row = row;
-      if (o.mode==='relay') await sendRelayFile(o, f);
-      else await sendP2PFile(o, f);
+      try {
+        if (o.mode==='relay') await sendRelayFile(o, f);
+        else await sendP2PFile(o, f);
+      } catch(e){
+        // ★ sendP2PFile 现在会抛异常（通道断开/超时），不要让一个文件失败阻塞后续
+        sendError = e;
+        TR('sendFileErr:'+e.message);
+        f.acked = f.acked || 0; // 保留已发送量
+      }
     }
-    const hadErr = !o.job.files.every(f=>(f.acked||0)>=f.size);
-    // 一轮传输完成：若有正在等待的下一批，先复位为 idle 再 kickPending，
-    // 否则停在 idle（允许用户后续任意次点击发送继续复用通道）
+    const hadErr = sendError || !o.job.files.every(f=>(f.acked||0)>=f.size);
     o.status = hadErr ? 'failed' : 'idle';
-    if (!hadErr) o.job = null; // 清空已完成 job，下一轮重新构建（避免旧文件行占槽）
+    o.error = sendError ? sendError.message : '';
+    if (!hadErr) o.job = null;
     updateProgress(o);
     if (!hadErr) toast('✅ 已发送给「'+o.target.name+'」','ok');
-    else toast('⚠️ 部分文件未完成发送','warn');
+    else toast('⚠️ ' + (sendError ? sendError.message : '部分文件未完成发送'),'warn');
     kickPending(o);
   }
 
   async function sendP2PFile(o, f){
     const dc = o.dc; if (!dc || dc.readyState!=='open'){ throw new Error('通道已断开'); }
-    // 无序模式下：二进制消息头 8 bytes = seq(4) + total(4) Uint32LE
-    // 接收端按 seq 存入 Map，直到收到 total 个不同 seq 后直接 new Blob（省掉内存 memcpy）
     const total = f.size;
     const totalSeqs = Math.max(1, Math.ceil(total / CHUNK));
+    const chunkCache = new Map();
     dc.send(JSON.stringify({ kind:'meta', fileId:f.fileId, name:f.name, size:total, type:f.type, totalSeqs })); TR('out:meta');
     let off = 0, seq = 0, lastAckBytes = 0;
     f.acked = 0;
-    // 计算 bufferedAmount 低水位：一次只让浏览器缓冲 BATCH_THRESHOLD 就释放事件循环
-    function waitDrain(){ if (dc.bufferedAmount >= BATCH_THRESHOLD) {
-      return new Promise(r=>{ const id=setInterval(()=>{ if(dc.bufferedAmount < BATCH_THRESHOLD){clearInterval(id); r();} }, 6); });
-    }}
-    while (off < total){
-      // 1. 准备切片（256KB）
-      const slice = f.file.slice(off, off + CHUNK);
-      const buf = await slice.arrayBuffer();
-      // 2. 构造带序数据：8 字节头 + 原始 payload
-      const payload = new Uint8Array(8 + buf.byteLength);
-      const dv = new DataView(payload.buffer, payload.byteOffset, 8);
-      dv.setUint32(0, seq, true);            // 0..3  seq
-      dv.setUint32(4, totalSeqs, true);      // 4..7  total seqs
-      payload.set(new Uint8Array(buf), 8);
-      // 3. 发送
-      try { dc.send(payload.buffer || payload); } catch(e){ /* rare */ await new Promise(r=>setTimeout(r,30)); dc.send(payload); }
-      off += buf.byteLength; seq++;
-      o._sent += buf.byteLength;
-      // 4. 进度按乐观方式推进（接收端 ack 会修正到真正已落盘值；两者取 max 防止倒退）
-      f.acked = Math.max((f.acked||0), off);
-      updateProgress(o);
-      // 5. 低水位控制：缓冲 >16MB 时等浏览器 flush 一下
-      if (dc.bufferedAmount >= BATCH_THRESHOLD) await waitDrain();
-      // 6. 每 2MB 发一个 keep-alive/ACK 请求（接收端会异步回最新 cursor），目的是进度实时同步（不阻塞发送）
-      if (off - lastAckBytes >= ACK_EVERY || off >= total){
-        lastAckBytes = off;
-        try { dc.send(JSON.stringify({ kind:'poll', fileId:f.fileId })); } catch(e){}
-      }
-      // 7. 每 2MB 让出一次微任务（避免 UI 冻结，但绝不做 4ms 慢定时器）
-      if ((off & 0x1fffff) === 0) await Promise.resolve();
+
+    // ★ 用 onbufferedamountlow 事件替代 setInterval 轮询
+    // 原问题：setInterval 在 iOS Safari 后台/节流模式下不执行 → waitDrain 永远不 resolve → 发送卡死
+    const LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 低水位
+    let drainResolver = null;
+    let drainTimeout = null;
+    const prevLowHandler = dc.onbufferedamountlow;
+    dc.bufferedAmountLowThreshold = LOW_THRESHOLD;
+    dc.onbufferedamountlow = () => {
+      if (drainResolver) { const r = drainResolver; drainResolver = null; clearTimeout(drainTimeout); drainTimeout = null; r(); }
+    };
+
+    function waitDrain(){
+      if (dc.readyState !== 'open') { cleanup(); return Promise.reject(new Error('通道已断开')); }
+      if (dc.bufferedAmount < BATCH_THRESHOLD) return Promise.resolve();
+      // 等待 onbufferedamountlow 事件，15 秒超时兜底
+      // 同时用 setTimeout 做二次 fallback：每 200ms 检查一次（防止某些浏览器不触发事件）
+      return new Promise((resolve, reject)=>{
+        let settled = false;
+        function done(ok){ if (settled) return; settled = true; clearInterval(pollId); clearTimeout(drainTimeout); drainResolver = null; ok ? resolve() : reject(new Error('通道已断开')); }
+        drainResolver = () => done(true);
+        // 事件触发
+        // 超时兜底
+        drainTimeout = setTimeout(()=>{
+          if (dc.readyState !== 'open') done(false);
+          else { TR('drainTimeout:force'); done(true); }
+        }, 15000);
+        // 轮询 fallback（防 onbufferedamountlow 不触发）
+        const pollId = setInterval(()=>{
+          if (dc.readyState !== 'open') { done(false); return; }
+          if (dc.bufferedAmount < BATCH_THRESHOLD) done(true);
+        }, 200);
+      });
     }
-    // 尾：发送 end（接收端收到后若 seqMap 齐全立刻 finalize）
-    try { dc.send(JSON.stringify({ kind:'end', fileId:f.fileId })); } catch(e){}
-    // 最终态：如果接收端最后回的 ack 更大就再拿最大值（已经在 onmessage 里 Math.max 了）
-    f.acked = Math.max((f.acked||0), total);
+
+    function cleanup(){
+      if (drainTimeout) { clearTimeout(drainTimeout); drainTimeout = null; }
+      drainResolver = null;
+      dc.onbufferedamountlow = prevLowHandler || null;
+    }
+
+    // 接收端请求重传缺失分片时触发
+    function handleResend(msg){
+      if (msg.kind==='resend' && msg.fileId===f.fileId && Array.isArray(msg.seqs)){
+        for (const s of msg.seqs){
+          const cached = chunkCache.get(s);
+          if (cached !== undefined){
+            try { dc.send(cached); } catch(e){ TR('resendErr:seq='+s); }
+          }
+        }
+        TR('resend:'+msg.seqs.length+' seqs');
+      }
+    }
+    if (o._resendHandler) dc.removeEventListener('message', o._resendHandler);
+    o._resendHandler = (ev)=>{
+      if (typeof ev.data !== 'string') return;
+      let m; try { m = JSON.parse(ev.data); } catch(e){ return; }
+      handleResend(m);
+    };
+    dc.addEventListener('message', o._resendHandler);
+
+    try {
+      while (off < total){
+        // ★ 检查通道状态 + 连接状态（防半开连接卡死）
+        if (dc.readyState !== 'open' || o.status === 'failed' ||
+            (o.pc && (o.pc.connectionState === 'failed' || o.pc.connectionState === 'closed'))) {
+          throw new Error('通道已断开 (off='+off+', dc='+dc.readyState+', pc='+ (o.pc?o.pc.connectionState:'?') +')');
+        }
+
+        const slice = f.file.slice(off, off + CHUNK);
+        const buf = await slice.arrayBuffer();
+        const payload = new Uint8Array(8 + buf.byteLength);
+        const dv = new DataView(payload.buffer, payload.byteOffset, 8);
+        dv.setUint32(0, seq, true);
+        dv.setUint32(4, totalSeqs, true);
+        payload.set(new Uint8Array(buf), 8);
+        chunkCache.set(seq, payload.buffer);
+
+        try { dc.send(payload.buffer || payload); } catch(e){
+          if (dc.readyState !== 'open') throw new Error('通道已断开（send失败）');
+          await new Promise(r=>setTimeout(r,30));
+          if (dc.readyState !== 'open') throw new Error('通道已断开');
+          try { dc.send(payload); } catch(e2){ throw new Error('发送失败: '+e2.message); }
+        }
+        off += buf.byteLength; seq++;
+        o._sent += buf.byteLength;
+        f.acked = Math.max((f.acked||0), off);
+        updateProgress(o);
+
+        // 低水位控制：用事件驱动而非轮询
+        if (dc.bufferedAmount >= BATCH_THRESHOLD) await waitDrain();
+
+        if (off - lastAckBytes >= ACK_EVERY || off >= total){
+          lastAckBytes = off;
+          try { dc.send(JSON.stringify({ kind:'poll', fileId:f.fileId })); } catch(e){}
+        }
+
+        if ((off & 0x1fffff) === 0) await Promise.resolve();
+      }
+      try { dc.send(JSON.stringify({ kind:'end', fileId:f.fileId })); } catch(e){}
+      f.acked = Math.max((f.acked||0), total);
+    } finally {
+      cleanup();
+      // ★ 修复：resend handler 延迟到与 chunkCache 同步移除（30s），否则 end 后重传请求被静默丢弃
+      setTimeout(()=>{
+        if (o._resendHandler) { dc.removeEventListener('message', o._resendHandler); o._resendHandler = null; }
+        chunkCache.clear();
+      }, 30000);
+    }
   }
 
   async function sendRelayFile(o, f){
@@ -1127,43 +1206,6 @@
       if (g && g.pc){ try{g.pc.close();}catch(e){} g.pc=null; }
       const o = state.outSessions.get(from); if (o && o.pc){ try{o.pc.close();}catch(e){} o.pc=null; }
     }
-  }
-
-  async function incomingOffer(from, name, sdp){
-    TR('offer:enter kind=' + (sdp && sdp.type) + ' sdpLen=' + ((sdp&&sdp.sdp)||'').length);
-    const g = createRecvGroup(from, name, 'desktop');
-    g.offerSeen = true;
-    if (g.pc) { g.earlyReturn = true; TR('offer:early'); return; } // 已建
-    const pc = new RTCPeerConnection({ iceServers:FALLBACK_STUN });
-    g.pc = pc; TR('offer:pc');
-    pc.onicecandidate = e => { if (e.candidate) signalTo(from, { kind:'ice', candidate:e.candidate }); };
-    pc.onconnectionstatechange = () => { if (pc.connectionState==='failed' && g.status!=='receiving' && !g.act) g.status='failed'; };
-    let dc;
-    try { dc = pc.createDataChannel('xfer', { negotiated:true, id:0, ordered:true }); TR('offer:dc'); }
-    catch(e){ window.__errs.push('dcCreate:'+e.message); g.attachErr = e.message; TR('offer:dcErr:'+e.message); return; }
-    attachIn(g, dc); TR('offer:attached');
-    try {
-      await pc.setRemoteDescription(sdp); TR('offer:srd');
-      for (const c of (g.pendingIce||[])) { try{await pc.addIceCandidate(c);}catch(e){} } g.pendingIce=[];
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      const r = await signalTo(from, { kind:'answer', sdp:answer });
-      TR('offer:answered');
-      if (!r.ok) window.__errs.push('answer:'+(r.error||''));
-    } catch(e){ window.__errs.push('offer:'+e.message); TR('offer:ERR:'+e.message); }
-  }
-
-  function attachIn(g, dc){
-    dc.binaryType='arraybuffer';
-    g.dc = dc; g.dcState = dc.readyState; g.gotMsg = 0; g._attached = true;
-    dc.onopen = () => { g.dcState = 'open'; };
-    dc.onmessage = ev => { g.gotMsg = (g.gotMsg||0) + 1; TR('in:msg:' + typeof ev.data);
-      if (typeof ev.data==='string'){
-        let m; try{m=JSON.parse(ev.data);}catch(e){return;}
-        if (m.kind==='meta') startFile(g, m);
-        else if (m.kind==='end') finalizeFile(g, m.fileId);
-      } else { writeSeq(g, ev.data); }
-    };
   }
 
   function onRelay(from, name, p){
@@ -1308,9 +1350,19 @@
       if (typeof ev.data==='string'){
         let m; try{m=JSON.parse(ev.data);}catch(e){return;}
         if (m.kind==='meta') startFile(g, m);
-        else if (m.kind==='end') finalizeFile(g, m.fileId);
+        else if (m.kind==='end') {
+          // ★ end 消息：检查分片是否齐全，缺失则请求重传而非直接 finalize
+          if (g.act && g.act.mode==='p2p' && g.act.seqMap.size < g.act.totalSeqs){
+            g.act._endSeen = true;
+            TR('end:missing=' + (g.act.totalSeqs - g.act.seqMap.size) + '/' + g.act.totalSeqs);
+            requestMissingSeqs(g.act);
+            // 重新调度 deadline 等待重传
+            scheduleDeadline(g.act);
+          } else {
+            finalizeFile(g, m.fileId);
+          }
+        }
         else if (m.kind==='poll'){
-          // 发送端问当前接收进度 → 单向回一次 ack，不频繁（每 2MB 一次）
           if (g.act && g.dc && g.dc.readyState==='open'){
             try{ g.dc.send(JSON.stringify({kind:'ack',fileId:g.act.fileId,bytes:bytesReceived(g.act)})); }catch(e){}
           }
@@ -1338,29 +1390,62 @@
       fileId:m.fileId, size:m.size||0,
       totalSeqs: Math.max(1, Math.ceil((m.size||0) / CHUNK)),
       seqMap: new Map(), buf: isRelay ? new Uint8Array(m.size||0) : null, cursor:0, lastAck:0,
-      row, mode: isRelay?'relay':'p2p', _bytes:0, _deadlineTimer:null
+      row, mode: isRelay?'relay':'p2p', _bytes:0, _deadlineTimer:null,
+      _g: g,                    // ★ 反向引用 group（deadline 回调里用）
+      _endSeen: false,          // ★ 是否已收到 end 消息
+      _resendCount: 0,         // ★ 已请求重传的轮数（防死循环）
+      _resendRequested: new Set() // ★ 已请求过的 seq 集合（防重复请求）
     };
     if (g.status!=='receiving') g.status='receiving';
-    // 新增：8 秒无新分片自动 finalize（避免 MQTT 丢片卡死）
     scheduleDeadline(g.act);
     updateProgress(g);
   }
   function scheduleDeadline(a){
     if (!a || a.size===0) return;
     clearTimeout(a._deadlineTimer);
+    // ★ 动态超时：小文件 8s，大文件按 1s/10MB 递增，上限 60s
+    // 原问题：8s 固定超时对 65MB+ 文件太短，ICE 重连/网络抖动暂停即触发 interrupted
+    const timeoutMs = Math.min(60000, 8000 + Math.floor(a.size / (10*1024*1024)) * 1000);
     a._deadlineTimer = setTimeout(()=>{
       if (a._finalized) return;
-      // 已经 ≥80% 进度且最后一刻不涨 → 当作结束，允许保存不完整（用户选择继续/放弃由 UI 决定）
       const got = bytesReceived(a);
-      if (got>0 && got<a.size && a.row && a.row.status==='receiving'){
-        TR('deadline: incomplete finalize got=' + got + ' size=' + a.size);
-        // 不立即保存，但通过标记 row.status=interrupted 让用户知道有问题；UI 进度不再卡死
+      if (got>=0 && got<a.size && a.row && a.row.status==='receiving'){
+        TR('deadline: incomplete got=' + got + ' size=' + a.size + ' timeout=' + timeoutMs);
+        if (a.mode==='p2p' && a._g && a._g.dc && a._g.dc.readyState==='open' && a._resendCount < 3){
+          requestMissingSeqs(a);
+          // 重新调度 deadline 给重传一个机会
+          scheduleDeadline(a);
+          return;
+        }
         a.row.status = 'interrupted';
         a.row.bytes = got;
-        updateProgress(g_owningAct(a) || (a.row && a.row._ownerGroup));
+        updateProgress(a._g || g_owningAct(a));
         clearTimeout(a._deadlineTimer);
       }
-    }, 8000);
+    }, timeoutMs);
+  }
+
+  // ★ 请求缺失分片重传：检查 seqMap 中缺失的 seq，发 resend 请求给发送端
+  function requestMissingSeqs(a){
+    if (!a || a.mode!=='p2p' || !a._g || !a._g.dc || a._g.dc.readyState!=='open') return;
+    // ★ 修复：每轮重传前清空 _resendRequested，允许重新请求上一轮失败的重传
+    a._resendRequested.clear();
+    const missing = [];
+    for (let i=0; i<a.totalSeqs; i++){
+      if (!a.seqMap.has(i)) missing.push(i);
+    }
+    if (!missing.length) return;
+    // 分批发送重传请求（避免单条消息过大）
+    const BATCH = 64;
+    for (let i=0; i<missing.length; i+=BATCH){
+      const batch = missing.slice(i, i+BATCH);
+      batch.forEach(s => a._resendRequested.add(s));
+      try {
+        a._g.dc.send(JSON.stringify({ kind:'resend', fileId:a.fileId, seqs:batch }));
+      } catch(e){ TR('resendReqErr:'+e.message); }
+    }
+    a._resendCount++;
+    TR('resendReq: ' + missing.length + ' seqs round=' + a._resendCount);
   }
   function g_owningAct(a){
     for (const g of state.recvGroups.values()){ if (g.act===a) return g; }
@@ -1369,8 +1454,6 @@
 
   function writeSeq(g, ab){
     const a = g.act; if (!a) return;
-    // P2P 新格式：前 8 字节是 seq(4) + totalSeqs(4) Uint32LE
-    // 旧兼容：老发送端发送纯 ab（无序列头），当作「cursor+=len 有序」写入
     let u;
     try { u = new Uint8Array(ab); } catch(e){ return; }
     if (u.length >= 8 && a.mode==='p2p'){
@@ -1380,21 +1463,25 @@
         const tot = dv.getUint32(4, true);
         if (tot === a.totalSeqs && seq >=0 && seq < a.totalSeqs){
           const payload = u.subarray(8);
-          // 重复分片跳过（unordered 下可能偶尔重排序重复到达）
           if (!a.seqMap.has(seq)){
             a.seqMap.set(seq, payload);
             a._bytes = (a._bytes||0) + payload.byteLength;
             a.row.bytes = a._bytes;
+            // ★ 重传到达：清除 resendRequested 标记，允许后续再次请求
+            a._resendRequested.delete(seq);
           }
-          // ACK：每 2MB 回一次
           if (a._bytes - a.lastAck >= ACK_EVERY){ a.lastAck = a._bytes; sendAckBack(g,a); }
-          // 齐全或全部收完
-          if (a.seqMap.size >= a.totalSeqs) finalizeFile(g, a.fileId);
+          // ★ 齐全才 finalize；如果已收到 end 但仍缺失，不 finalize（等重传）
+          if (a.seqMap.size >= a.totalSeqs){
+            finalizeFile(g, a.fileId);
+          } else if (a._endSeen){
+            // 已收到 end 但分片不齐 → 重新请求缺失分片
+            requestMissingSeqs(a);
+          }
           scheduleDeadline(a);
           updateProgress(g);
           return;
         }
-        // 否则 fallthrough：按旧格式（纯数据）处理
       } catch(e){ /* fallthrough to legacy ordered write */ }
     }
     // 兼容：无 8 字节头（老发送端 / 中转 / 有序回退），当作 cursor 顺序写
@@ -1431,22 +1518,32 @@
     clearTimeout(a._deadlineTimer);
     g.act = null;
     try {
-      let blob;
-      if (a.mode === 'p2p'){
-        // 按 seq 顺序拼 Blob（零 memcpy，浏览器直接在各 ArrayBuffer 视图之间做引用合并）
-        const arr = new Array(a.totalSeqs);
-        for (let i=0;i<a.totalSeqs;i++) arr[i] = a.seqMap.get(i) || new Uint8Array(0);
-        blob = new Blob(arr, { type: a.type||'' });
+      // ★ 0 字节文件特殊处理
+      if (a.size === 0){
+        const blob = new Blob([], { type: a.type||'' });
+        a.row.blob = blob; a.row.url = URL.createObjectURL(blob);
+        a.row.status = 'done';
+        a.row.bytes = 0;
+        autoSave(a.row);
       } else {
-        blob = new Blob([a.buf.subarray(0, bytesReceived(a))], { type: a.type||'' });
+        let blob;
+        if (a.mode === 'p2p'){
+          const arr = new Array(a.totalSeqs);
+          for (let i=0;i<a.totalSeqs;i++) arr[i] = a.seqMap.get(i) || new Uint8Array(0);
+          blob = new Blob(arr, { type: a.type||'' });
+        } else {
+          blob = new Blob([a.buf.subarray(0, bytesReceived(a))], { type: a.type||'' });
+        }
+        // ★ 修复：释放旧的 Blob URL 防止内存泄漏
+        if (a.row.url) try { URL.revokeObjectURL(a.row.url); } catch(e){}
+        a.row.blob = blob; a.row.url = URL.createObjectURL(blob);
+        const got = bytesReceived(a);
+        if (got >= a.size) a.row.status='done';
+        else if (got === 0) a.row.status='interrupted';
+        else a.row.status='partial';
+        a.row.bytes = got;
+        autoSave(a.row);
       }
-      a.row.blob = blob; a.row.url = URL.createObjectURL(blob);
-      const got = bytesReceived(a);
-      if (got >= (a.size||1) - 1 && a.size>0) a.row.status='done';
-      else if (got === 0) a.row.status='interrupted';
-      else a.row.status='partial';
-      a.row.bytes = got;
-      autoSave(a.row);
     } catch(e){ TR('finalizeERR:'+e.message); a.row.status='interrupted'; }
     if (g.files.every(f=>f.status==='done'||f.status==='interrupted'||f.status==='partial')) g.status='done';
     updateProgress(g);
